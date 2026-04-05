@@ -14,7 +14,7 @@ Détection :
 Corrélation :
   - Par rôle (indépendante des noms de nœuds)
   - Temporelle (qui a dégradé en premier)
-  - 5 scénarios télécom + fallback
+  - 6 scénarios télécom + fallback
 
 Fixes v3.4 :
   - Fix 6 : collect_features_for_node() utilise rate() sur tous les compteurs
@@ -775,9 +775,11 @@ def correlate(features_by_node: dict, anomalies: list,
         sdp_feat.get("sdp_timeout", 0)  >= T["corr_sdp_timeout_rate"] or
         sdp_feat.get("sdp_conflict", 0) >= T["corr_sdp_conflict_rate"]
     )
-    # ccn_impacted : rate de lookup_fail > seuil (0 si pas d'incident SDP actif)
+    # ccn_impacted : lookup_fail OU comm_error élevés
+    # ccn_comm_error peut rester élevé quand ccn_lookup_fail vient de redescendre
     ccn_impacted = (
-        ccn_feat.get("ccn_lookup_fail", 0) >= T["corr_ccn_lookup_rate"]
+        ccn_feat.get("ccn_lookup_fail", 0) >= T["corr_ccn_lookup_rate"] or
+        ccn_feat.get("ccn_comm_error",  0) >= T["corr_ccn_lookup_rate"]
     )
     # occ_impacted : gauge alarm_state OU rate alarmes critiques
     occ_impacted = (
@@ -893,6 +895,60 @@ def correlate(features_by_node: dict, anomalies: list,
             "impacted_roles":      ["AF"] + list(nodes_by_role.keys()),
             "supporting_signals":  ["svc_dns_up=0"],
             "scenario":            "DNS_DOWN",
+        })
+        return correlation
+
+    # Scénario 6 : Cascade partielle SDP → CCN (OCC pas encore impacté)
+    # Cas typique : incident SDP récent qui commence à impacter CCN
+    # mais l'OCC n'a pas encore eu le temps de réagir
+    if sdp_degraded and ccn_impacted and not occ_impacted:
+        sdp_nodes = nodes_by_role.get("SDP", [])
+        ccn_nodes = nodes_by_role.get("CCN", [])
+        correlation.update({
+            "probable_root_cause": "SDP degradation cascading to CCN",
+            "severity":            "CRITICAL",
+            "summary": (
+                f"SDP ({', '.join(sdp_nodes)}) est la root-cause. "
+                f"CCN lookup={ccn_feat.get('ccn_lookup_fail',0):.2f} — "
+                "cascade en cours, OCC non encore impacte."
+                + (f" {temporal_summary}" if temporal_summary else "")
+            ),
+            "impacted_nodes":     sdp_nodes + ccn_nodes,
+            "impacted_roles":     ["SDP", "CCN"],
+            "supporting_signals": [
+                f"SDP to={sdp_feat.get('sdp_timeout',0):.2f} "
+                f"co={sdp_feat.get('sdp_conflict',0):.2f}",
+                f"CCN lookup={ccn_feat.get('ccn_lookup_fail',0):.2f}",
+                "OCC: pas encore impacte",
+            ],
+            "scenario": "SDP_CCN_CASCADE",
+        })
+        return correlation
+
+    # Scénario 7 : Cascade SDP → OCC (CCN non détecté au moment du scraping)
+    # ccn_lookup peut être à 0 momentanément si sdp_bad vient de s'arrêter
+    # mais l'OCC garde son alarme active — la cascade SDP→OCC reste probable
+    if sdp_degraded and occ_impacted and not ccn_impacted:
+        sdp_nodes = nodes_by_role.get("SDP", [])
+        occ_nodes = nodes_by_role.get("OCC", [])
+        ccn_nodes = nodes_by_role.get("CCN", [])
+        correlation.update({
+            "probable_root_cause": "SDP degradation with OCC impact",
+            "severity":            "CRITICAL",
+            "summary": (
+                f"SDP ({', '.join(sdp_nodes)}) est la root-cause. "
+                f"OCC alarm_state=1 — cascade SDP→OCC confirmee "
+                "(CCN non detecte au moment du scraping)."
+                + (f" {temporal_summary}" if temporal_summary else "")
+            ),
+            "impacted_nodes":     sdp_nodes + occ_nodes + ccn_nodes,
+            "impacted_roles":     ["SDP", "OCC", "CCN"],
+            "supporting_signals": [
+                f"SDP to={sdp_feat.get('sdp_timeout',0):.2f} "
+                f"co={sdp_feat.get('sdp_conflict',0):.2f}",
+                f"OCC alarm_state=1 alarm_rate={occ_feat.get('alarm_critical',0):.3f}/s",
+            ],
+            "scenario": "SDP_OCC_CASCADE",
         })
         return correlation
 
@@ -1029,7 +1085,7 @@ def main():
     payload = {
         "generated_at":               datetime.now(timezone.utc).isoformat(),
         "source_health_generated_at": health_ts,
-        "engine_version":             "hybrid-v3.4",
+        "engine_version":             "hybrid-v3.5",
         "discovered_nodes":           len(nodes_meta),
         "nodes_by_role":              nodes_by_role,
         "detection_sources": {
